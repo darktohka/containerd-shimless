@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -62,6 +63,11 @@ func (m *ShimManager) LoadExistingShims(ctx context.Context, stateDir string, ro
 	}
 	return nil
 }
+
+// inProcessStateFile is the per-bundle state file written by an in-process
+// runtime engine. A bundle that contains it is engine-owned: with no shim
+// binary for the runtime, loading it as a shim would fail and delete it.
+const inProcessStateFile = "shimless.json"
 
 func (m *ShimManager) loadShims(ctx context.Context, stateDir string) error {
 	ns, err := namespaces.NamespaceRequired(ctx)
@@ -111,6 +117,9 @@ func (m *ShimManager) loadShims(ctx context.Context, stateDir string) error {
 			}
 			if len(bf) == 0 {
 				bundle.Delete()
+				return nil
+			}
+			if slices.Contains(bf, inProcessStateFile) {
 				return nil
 			}
 			if err := m.loadShim(ctx2, bundle); err != nil {

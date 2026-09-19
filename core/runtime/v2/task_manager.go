@@ -51,6 +51,29 @@ import (
 type TaskConfig struct {
 	// Supported platforms
 	Platforms []string `toml:"platforms"`
+
+	// Shimless configures the experimental in-process shimless engine.
+	Shimless ShimlessConfig `toml:"shimless"`
+}
+
+// ShimlessConfig configures the optional in-process shimless engine. The engine
+// is disabled by default and only available on Linux.
+type ShimlessConfig struct {
+	// Enabled opts the task manager into routing supported runtime names to
+	// the in-process engine instead of a shim.
+	Enabled bool `toml:"enabled"`
+	// CrunPath overrides the crun binary. Empty resolves crun from PATH.
+	CrunPath string `toml:"crun_path"`
+	// CrunRoot is passed to crun as --root. Empty uses crun's default.
+	CrunRoot string `toml:"crun_root"`
+	// RuntimeName is the runtime name prefix the engine handles.
+	RuntimeName string `toml:"runtime_name"`
+	// CgroupRoot overrides the cgroup v2 mount point.
+	CgroupRoot string `toml:"cgroup_root"`
+	// Autokill kills tasks when the daemon releases their pidfd, so a daemon
+	// crash tears down the containers it started. Off by default so tasks
+	// survive a daemon restart.
+	Autokill bool `toml:"autokill"`
 }
 
 func init() {
@@ -61,6 +84,7 @@ func init() {
 			plugins.ShimPlugin,
 			plugins.MountManagerPlugin,
 			plugins.WarningPlugin,
+			plugins.EventPlugin,
 		},
 		Config: &TaskConfig{
 			Platforms: defaultPlatforms(),
@@ -103,6 +127,11 @@ func init() {
 				return nil, fmt.Errorf("failed to load existing shims for task manager")
 			}
 
+			engine, err := newShimlessEngine(ic, config, state)
+			if err != nil {
+				return nil, err
+			}
+
 			warningsI, err := ic.GetSingle(plugins.WarningPlugin)
 			if err != nil {
 				return nil, err
@@ -118,6 +147,7 @@ func init() {
 					manager: mounts,
 					legacy:  newDeprecatedMountCapabilities(shimManager),
 				},
+				engine: engine,
 			}, nil
 		},
 	})
@@ -129,6 +159,18 @@ type TaskManager struct {
 	state      string
 	manager    *ShimManager
 	taskMounts *taskMountController
+	// engine is an optional in-process runtime engine. When non-nil it is
+	// consulted before the shim path for tasks whose runtime it supports.
+	engine taskEngine
+}
+
+// Close releases the optional in-process engine. It is safe to call when no
+// engine is configured.
+func (m *TaskManager) Close() error {
+	if m.engine == nil {
+		return nil
+	}
+	return m.engine.Close()
 }
 
 // NewTaskManager creates a new task manager instance.
@@ -189,6 +231,24 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 	// which mount types and transforms it performs itself, which decides what
 	// the mount manager must do on its behalf. Starting the shim does not
 	// require the rootfs; only the task.Create call below consumes opts.Rootfs.
+	//
+	// An in-process engine (when enabled and matching opts.Runtime) takes over
+	// here: it has no shim to advertise mount capabilities, so the mount
+	// manager performs every mount it can and the engine handles the residual
+	// System set.
+	if m.engine != nil && m.engine.Supports(opts.Runtime) {
+		activation, err = m.taskMounts.ActivateSystem(ctx, taskID, opts.Rootfs)
+		if err != nil {
+			return nil, err
+		}
+		opts.Rootfs = activation.rootfs
+		t, err := m.engine.Create(ctx, taskID, bundle.Path, opts.Spec, activation.rootfs, opts)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	}
+
 	shim, err := m.manager.Start(ctx, taskID, bundle, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shim: %w", err)
@@ -275,6 +335,15 @@ func (m *TaskManager) cleanupStartedShim(ctx context.Context, taskID string, shi
 
 // Get a specific task
 func (m *TaskManager) Get(ctx context.Context, id string) (runtime.Task, error) {
+	if m.engine != nil {
+		t, err := m.engine.Get(ctx, id)
+		if err == nil {
+			return t, nil
+		}
+		if !errdefs.IsNotFound(err) {
+			return nil, err
+		}
+	}
 	shim, err := m.manager.shims.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -296,11 +365,34 @@ func (m *TaskManager) Tasks(ctx context.Context, all bool) ([]runtime.Task, erro
 		}
 		out[i] = newClient
 	}
+	if m.engine != nil {
+		engineTasks, err := m.engine.Tasks(ctx, all)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, engineTasks...)
+	}
 	return out, nil
 }
 
 // Delete deletes the task and shim instance
 func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit, error) {
+	if m.engine != nil {
+		exit, err := m.engine.Delete(ctx, taskID)
+		if err == nil {
+			if derr := m.deleteEngineBundle(ctx, taskID); derr != nil {
+				log.G(ctx).WithError(derr).WithField("task", taskID).Error("failed to delete bundle")
+			}
+			if merr := m.taskMounts.Deactivate(ctx, taskID); merr != nil && !errdefs.IsNotFound(merr) {
+				log.G(ctx).WithError(merr).WithField("task", taskID).Errorf("failed to deactivate mounts")
+			}
+			return exit, nil
+		}
+		if !errdefs.IsNotFound(err) {
+			return nil, err
+		}
+	}
+
 	shim, err := m.manager.shims.Get(ctx, taskID)
 	if err != nil {
 		return nil, err
@@ -340,6 +432,14 @@ func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit,
 		return nil, fmt.Errorf("failed to delete task: %w", err)
 	}
 	return exit, nil
+}
+
+func (m *TaskManager) deleteEngineBundle(ctx context.Context, taskID string) error {
+	bundle, err := LoadBundle(ctx, m.state, taskID)
+	if err != nil {
+		return err
+	}
+	return bundle.Delete()
 }
 
 func supportedLogURISchemes() []string {

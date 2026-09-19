@@ -19,12 +19,17 @@ package v2
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/containerd/errdefs"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/containerd/containerd/v2/core/containers"
 	runtimeapi "github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 func TestShouldCleanupShim(t *testing.T) {
@@ -94,4 +99,40 @@ func TestShouldCleanupShim(t *testing.T) {
 			require.Equal(t, tc.Expected, shouldCleanupShim(tc.SgetErr, tc.PidErr, tc.PInfo))
 		})
 	}
+}
+
+type missingContainerStore struct{}
+
+var _ containers.Store = missingContainerStore{}
+
+func (missingContainerStore) Get(context.Context, string) (containers.Container, error) {
+	return containers.Container{}, errdefs.ErrNotFound
+}
+
+func (missingContainerStore) List(context.Context, ...string) ([]containers.Container, error) {
+	return nil, nil
+}
+
+func (missingContainerStore) Create(context.Context, containers.Container) (containers.Container, error) {
+	return containers.Container{}, nil
+}
+
+func (missingContainerStore) Update(context.Context, containers.Container, ...string) (containers.Container, error) {
+	return containers.Container{}, nil
+}
+
+func (missingContainerStore) Delete(context.Context, string) error { return nil }
+
+func TestLoadShimsSkipsInProcessBundles(t *testing.T) {
+	stateDir := t.TempDir()
+	ctx := namespaces.WithNamespace(context.Background(), "default")
+
+	bundle := filepath.Join(stateDir, "default", "task")
+	require.NoError(t, os.MkdirAll(bundle, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, inProcessStateFile), []byte("{}"), 0600))
+
+	m := &ShimManager{containers: missingContainerStore{}}
+	require.NoError(t, m.loadShims(ctx, stateDir))
+
+	assert.DirExists(t, bundle, "an in-process engine bundle must not be deleted by the shim loader")
 }

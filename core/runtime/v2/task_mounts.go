@@ -67,13 +67,29 @@ func (c *taskMountController) Activate(ctx context.Context, taskID string, runti
 	if c.manager == nil {
 		return mountActivation{rootfs: rootfs}, nil
 	}
+	return c.activate(ctx, taskID, rootfs, c.mountClaimOpts(ctx, runtimeName, bootstrap))
+}
 
+// ActivateSystem activates rootfs for an in-process engine that has no shim.
+// With no shim there is no mount capabilities advertisement to consult, so the
+// mount manager performs every mount it can and the caller handles the
+// residual System set. It is the engine analogue of Activate: the same
+// activation, without the deprecated shim-annotation lookup that would exec a
+// shim binary that this runtime does not have.
+func (c *taskMountController) ActivateSystem(ctx context.Context, taskID string, rootfs []mount.Mount) (mountActivation, error) {
+	if c.manager == nil {
+		return mountActivation{rootfs: rootfs}, nil
+	}
+	return c.activate(ctx, taskID, rootfs, nil)
+}
+
+func (c *taskMountController) activate(ctx context.Context, taskID string, rootfs []mount.Mount, claim []mount.ActivateOpt) (mountActivation, error) {
 	activateOpts := []mount.ActivateOpt{
 		mount.WithLabels(map[string]string{
 			"containerd.io/gc.bref.container": taskID,
 		}),
 	}
-	activateOpts = append(activateOpts, c.mountClaimOpts(ctx, runtimeName, bootstrap)...)
+	activateOpts = append(activateOpts, claim...)
 
 	ai, err := c.manager.Activate(ctx, taskID, rootfs, activateOpts...)
 	switch {

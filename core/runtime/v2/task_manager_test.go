@@ -19,8 +19,19 @@
 package v2
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/containerd/errdefs"
+	"github.com/containerd/typeurl/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 // setupAbsoluteShimPath creates a temporary directory in $PATH with an empty
@@ -95,4 +106,55 @@ func TestResolveRuntimePath(t *testing.T) {
 			t.Errorf("Expected %q, got %q", c.want, have)
 		}
 	}
+}
+
+type fakeEngine struct {
+	deleted   []string
+	deleteErr error
+}
+
+var _ taskEngine = (*fakeEngine)(nil)
+
+func (f *fakeEngine) Supports(string) bool { return true }
+
+func (f *fakeEngine) Create(context.Context, string, string, typeurl.Any, []mount.Mount, runtime.CreateOpts) (runtime.Task, error) {
+	return nil, nil
+}
+
+func (f *fakeEngine) Get(context.Context, string) (runtime.Task, error) {
+	return nil, errdefs.ErrNotFound
+}
+
+func (f *fakeEngine) Tasks(context.Context, bool) ([]runtime.Task, error) { return nil, nil }
+
+func (f *fakeEngine) Delete(_ context.Context, taskID string) (*runtime.Exit, error) {
+	f.deleted = append(f.deleted, taskID)
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
+	return &runtime.Exit{}, nil
+}
+
+func (f *fakeEngine) Close() error { return nil }
+
+func TestTaskManagerDeleteEngineRemovesBundle(t *testing.T) {
+	state := t.TempDir()
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+
+	bundlePath := filepath.Join(state, "test", "task")
+	require.NoError(t, os.MkdirAll(filepath.Join(bundlePath, "rootfs"), 0700))
+
+	eng := &fakeEngine{}
+	tm := &TaskManager{
+		state:      state,
+		taskMounts: &taskMountController{},
+		engine:     eng,
+	}
+
+	_, err := tm.Delete(ctx, "task")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"task"}, eng.deleted)
+
+	_, err = os.Stat(bundlePath)
+	assert.True(t, os.IsNotExist(err), "bundle directory must be removed for engine tasks")
 }

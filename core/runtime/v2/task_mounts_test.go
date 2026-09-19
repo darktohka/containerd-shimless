@@ -289,6 +289,49 @@ func TestTaskMountControllerActivate(t *testing.T) {
 	})
 }
 
+func TestTaskMountControllerActivateSystem(t *testing.T) {
+	rootfs := []mount.Mount{{Type: "bind", Source: "/src"}}
+
+	t.Run("nil manager returns rootfs unchanged", func(t *testing.T) {
+		c := &taskMountController{}
+		activation, err := c.ActivateSystem(context.Background(), "task", rootfs)
+		require.NoError(t, err)
+		assert.Equal(t, rootfs, activation.rootfs)
+		assert.False(t, activation.owned)
+	})
+
+	t.Run("success is owned and returns system mounts", func(t *testing.T) {
+		system := []mount.Mount{{Type: "overlay"}}
+		fm := &fakeMountManager{activateAI: mount.ActivationInfo{System: system}}
+		c := &taskMountController{manager: fm}
+
+		activation, err := c.ActivateSystem(context.Background(), "task", rootfs)
+		require.NoError(t, err)
+		assert.Equal(t, system, activation.rootfs)
+		assert.True(t, activation.owned)
+	})
+
+	t.Run("never consults the deprecated annotation", func(t *testing.T) {
+		fm := &fakeMountManager{}
+		legacyCalled := false
+		c := &taskMountController{
+			manager: fm,
+			legacy: &deprecatedMountCapabilities{
+				queryRuntimeInfo: func(context.Context, string) (*apitypes.RuntimeInfo, error) {
+					legacyCalled = true
+					return nil, errdefs.ErrUnavailable
+				},
+			},
+		}
+
+		_, err := c.ActivateSystem(context.Background(), "task", rootfs)
+		require.NoError(t, err)
+		assert.False(t, legacyCalled, "a shimless activation must not exec a shim binary")
+		assert.Empty(t, fm.lastActivateOpts.AllowMountTypes)
+		assert.Empty(t, fm.lastActivateOpts.AllowTransforms)
+	})
+}
+
 func TestTaskMountControllerDeactivate(t *testing.T) {
 	t.Run("nil manager is a no-op", func(t *testing.T) {
 		c := &taskMountController{}
