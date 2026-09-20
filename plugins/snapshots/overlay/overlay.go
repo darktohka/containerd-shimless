@@ -539,8 +539,17 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		return "", fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
+	fsPath := filepath.Join(td, "fs")
+	if err := os.Mkdir(fsPath, 0755); err != nil {
 		return td, err
+	}
+	// The "fs" directory is bind/overlay mounted as the container's root, so it
+	// must be traversable by the container's user. os.Mkdir applies the process
+	// umask, which may be stricter than 0755 (for example 0077 when containerd is
+	// started from a login shell), so set the mode explicitly. This mirrors the
+	// native snapshotter.
+	if err := os.Chmod(fsPath, 0755); err != nil {
+		return td, fmt.Errorf("failed to chmod %s to 0755: %w", fsPath, err)
 	}
 
 	if kind == snapshots.KindActive {

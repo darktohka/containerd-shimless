@@ -317,8 +317,14 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		return "", fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
+	fsPath := filepath.Join(td, "fs")
+	if err := os.Mkdir(fsPath, 0755); err != nil {
 		return td, err
+	}
+	// Match the native snapshotter: the "fs" directory is the container's root,
+	// so set its mode explicitly rather than leaving it to the process umask.
+	if err := os.Chmod(fsPath, 0755); err != nil {
+		return td, fmt.Errorf("failed to chmod %s to 0755: %w", fsPath, err)
 	}
 	if kind == snapshots.KindActive {
 		if !s.blockMode {
