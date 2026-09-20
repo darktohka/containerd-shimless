@@ -50,17 +50,34 @@ const (
 // crun create so that a crash mid-create can still be reconciled, and it is
 // updated on start and on exit.
 type taskState struct {
-	Version   int       `json:"v"`
-	Engine    string    `json:"engine"`
-	Crun      string    `json:"crun"`
-	ID        string    `json:"id"`
-	Namespace string    `json:"namespace"`
-	Bundle    string    `json:"bundle"`
-	Pid       int       `json:"pid"`
-	StartTime uint64    `json:"starttime"`
-	Cgroup    string    `json:"cgroup,omitempty"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"createdAt"`
+	Version   int         `json:"v"`
+	Engine    string      `json:"engine"`
+	Crun      string      `json:"crun"`
+	ID        string      `json:"id"`
+	Namespace string      `json:"namespace"`
+	Bundle    string      `json:"bundle"`
+	Pid       int         `json:"pid"`
+	StartTime uint64      `json:"starttime"`
+	Cgroup    string      `json:"cgroup,omitempty"`
+	State     string      `json:"state"`
+	CreatedAt time.Time   `json:"createdAt"`
+	Stdio     *stdioState `json:"stdio,omitempty"`
+
+	// LoggerPid and LoggerStart identify the external logging process started
+	// for this task. Reconcile compares them against /proc to detect a logger
+	// that survived a daemon restart, so it does not spawn a duplicate consumer
+	// for the same FIFO (which would block on the logger lock).
+	LoggerPid   int    `json:"loggerPid,omitempty"`
+	LoggerStart uint64 `json:"loggerStart,omitempty"`
+}
+
+// stdioState records the runtime IO paths for a task so a daemon restart can
+// reconstruct its stdio. It is only needed to re-attach a logging consumer.
+type stdioState struct {
+	Terminal bool   `json:"terminal,omitempty"`
+	Stdin    string `json:"stdin,omitempty"`
+	Stdout   string `json:"stdout,omitempty"`
+	Stderr   string `json:"stderr,omitempty"`
 }
 
 // exitState is the durable record of how a task exited. It is written by the

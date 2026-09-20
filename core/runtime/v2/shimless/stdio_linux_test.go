@@ -94,7 +94,7 @@ func TestNewBinaryCmdArgsAndEnv(t *testing.T) {
 }
 
 func TestNewStdioConfigEmptyIOOpensNullForEveryStream(t *testing.T) {
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestStdioConfigApplyNeverAssignsTypedNil(t *testing.T) {
 }
 
 func TestStdioConfigApplyAssignsRealFiles(t *testing.T) {
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestStdioConfigApplyAssignsRealFiles(t *testing.T) {
 func TestStdioConfigFileScheme(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "container.log")
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{
 		Stdout: "file://" + path,
 		Stderr: "file://" + path,
 	})
@@ -184,7 +184,7 @@ func TestStdioConfigSchemelessFifoOutput(t *testing.T) {
 	if err := unix.Mkfifo(fifoPath, 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{Stdout: fifoPath})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{Stdout: fifoPath})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -196,14 +196,14 @@ func TestStdioConfigSchemelessFifoOutput(t *testing.T) {
 }
 
 func TestStdioConfigRejectsUnknownScheme(t *testing.T) {
-	_, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{Stdout: "ttrpc+unix:///tmp/stream"})
+	_, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{Stdout: "ttrpc+unix:///tmp/stream"})
 	if err == nil {
 		t.Fatal("unknown stdio scheme should be rejected, not silently degraded")
 	}
 }
 
 func TestStdioConfigBinaryStartFailureIsSurfaced(t *testing.T) {
-	_, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{
+	_, err := newStdioConfig(context.Background(), "id", "ns", t.TempDir(), runtime.IO{
 		Stdout: "binary:///nonexistent/shimless-logging-binary?_X=y",
 	})
 	if err == nil {
@@ -212,7 +212,7 @@ func TestStdioConfigBinaryStartFailureIsSurfaced(t *testing.T) {
 }
 
 func TestStdioConfigTerminalCreatesConsoleSocket(t *testing.T) {
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{Terminal: true})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{Terminal: true})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestStdioConfigResizeIsNilSafe(t *testing.T) {
 		t.Fatalf("nil Resize = %v, want nil", err)
 	}
 
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestStdioConfigResizeIsNilSafe(t *testing.T) {
 }
 
 func TestStdioConfigCloseIsIdempotent(t *testing.T) {
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}
@@ -264,5 +264,150 @@ func TestStdioConfigCloseIsIdempotent(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// binaryURITo writes an executable logging-binary stub and returns a binary or
+// binary-v2 URI pointing at it. The binary-v2 stub signals readiness on fd 5.
+func binaryURITo(t *testing.T, scheme string) *url.URL {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "logger.sh")
+	script := "#!/bin/sh\n"
+	if scheme == "binary-v2" {
+		script += "printf x >&5\n"
+	}
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write logging binary stub: %v", err)
+	}
+	u, err := url.Parse(scheme + "://" + path)
+	if err != nil {
+		t.Fatalf("parse logging URI: %v", err)
+	}
+	return u
+}
+
+func TestStartBinaryIOCreatesFifos(t *testing.T) {
+	bundle := t.TempDir()
+	uri := binaryURITo(t, "binary-v2")
+
+	b, err := startBinaryIO(uri, "task-1", "default", bundle)
+	if err != nil {
+		t.Fatalf("startBinaryIO: %v", err)
+	}
+	defer func() {
+		_ = stopLogger(b.cmd)
+		_ = b.outW.Close()
+		_ = b.errW.Close()
+	}()
+
+	outPath, errPath := fifoPaths(bundle, "task-1")
+	for name, path := range map[string]string{"stdout": outPath, "stderr": errPath} {
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			t.Fatalf("stat %s fifo %s: %v", name, path, err)
+		}
+		if st.Mode&unix.S_IFIFO == 0 {
+			t.Errorf("%s %s mode = %#o, want a FIFO", name, path, st.Mode)
+		}
+	}
+	for name, f := range map[string]*os.File{"stdout": b.outW, "stderr": b.errW} {
+		flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFL, 0)
+		if err != nil {
+			t.Fatalf("fcntl %s: %v", name, err)
+		}
+		if flags&unix.O_RDWR != unix.O_RDWR {
+			t.Errorf("%s fd flags = %#x, want O_RDWR", name, flags)
+		}
+	}
+}
+
+func TestStartBinaryIOReusesExistingFifos(t *testing.T) {
+	bundle := t.TempDir()
+	uri := binaryURITo(t, "binary")
+	id := "task-reuse"
+
+	first, err := startBinaryIO(uri, id, "default", bundle)
+	if err != nil {
+		t.Fatalf("first startBinaryIO: %v", err)
+	}
+	defer func() {
+		_ = stopLogger(first.cmd)
+		_ = first.outW.Close()
+		_ = first.errW.Close()
+	}()
+	outPath, _ := fifoPaths(bundle, id)
+	var before unix.Stat_t
+	if err := unix.Stat(outPath, &before); err != nil {
+		t.Fatalf("stat first fifo: %v", err)
+	}
+
+	second, err := startBinaryIO(uri, id, "default", bundle)
+	if err != nil {
+		t.Fatalf("second startBinaryIO: %v", err)
+	}
+	defer func() {
+		_ = stopLogger(second.cmd)
+		_ = second.outW.Close()
+		_ = second.errW.Close()
+	}()
+	var after unix.Stat_t
+	if err := unix.Stat(outPath, &after); err != nil {
+		t.Fatalf("stat second fifo: %v", err)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino {
+		t.Fatalf("fifo recreated: before %d/%d, after %d/%d", before.Dev, before.Ino, after.Dev, after.Ino)
+	}
+}
+
+func TestReattachBinaryStdio(t *testing.T) {
+	bundle := t.TempDir()
+	uri := binaryURITo(t, "binary")
+	st := &taskState{
+		ID:        "task-1",
+		Namespace: "default",
+		Bundle:    bundle,
+		Stdio:     &stdioState{Stdout: uri.String()},
+	}
+
+	cfg, err := reattachBinaryStdio(st)
+	if err != nil {
+		t.Fatalf("reattachBinaryStdio: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("reattachBinaryStdio returned nil for a binary URI")
+	}
+	defer func() {
+		if err := cfg.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	if cfg.logger == nil {
+		t.Error("logger was not reconstructed")
+	}
+	if cfg.stdout == nil || cfg.stderr == nil {
+		t.Fatalf("FIFO files not held: stdout=%v stderr=%v", cfg.stdout, cfg.stderr)
+	}
+	outPath, errPath := fifoPaths(bundle, "task-1")
+	for _, path := range []string{outPath, errPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("fifo %s not created: %v", path, err)
+		}
+	}
+}
+
+func TestReattachBinaryStdioSkipsNonBinary(t *testing.T) {
+	st := &taskState{
+		ID:        "task-1",
+		Namespace: "default",
+		Bundle:    t.TempDir(),
+		Stdio:     &stdioState{Stdout: "file:///tmp/container.log"},
+	}
+	cfg, err := reattachBinaryStdio(st)
+	if err != nil {
+		t.Fatalf("reattachBinaryStdio: %v", err)
+	}
+	if cfg != nil {
+		t.Fatalf("reattachBinaryStdio = %+v, want nil for a non-binary URI", cfg)
 	}
 }

@@ -20,6 +20,7 @@ package shimless
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -27,6 +28,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/core/runtime/v2/shimless/logdriver"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -94,6 +96,17 @@ func (e *Engine) reconcileOne(ctx context.Context, st *taskState) {
 				t.pidfd = -1
 				t.mu.Unlock()
 				unix.Close(fd)
+			}
+			// Re-attach the logging consumer for a binary/binary-v2 task. The
+			// container kept its inherited FIFO fds across the restart, so a
+			// fresh logger can reopen them and drain buffered output. Failure is
+			// non-fatal: reconcile must never block daemon startup.
+			if cfg, rerr := reattachBinaryStdio(st); rerr != nil {
+				logger.WithError(rerr).Warn("failed to re-attach logging consumer")
+			} else if cfg != nil {
+				t.mu.Lock()
+				t.stdio = cfg
+				t.mu.Unlock()
 			}
 			logger.Info("reconciled running shimless task")
 			return
@@ -178,4 +191,93 @@ func cgroupContains(cg *cgroup, pid int) bool {
 	}
 	in, err := cg.Contains(pid)
 	return err == nil && in
+}
+
+// reattachBinaryStdio rebuilds the logging consumer for a reconciled running
+// task whose persisted stdio used a binary/binary-v2 URI. For a nerdctl logging
+// URI whose driver logdriver supports it re-attaches an in-process sink; tryLock
+// reports a writer that survived the restart so a duplicate consumer is never
+// attached. Otherwise it reopens the task's FIFOs and spawns a fresh logger,
+// returning a stdioConfig whose Close stops the consumer and releases the
+// engine's FIFO fds. It returns (nil, nil) when the persisted stdio does not use
+// a binary scheme or when a live writer makes re-attaching unsafe.
+func reattachBinaryStdio(st *taskState) (*stdioConfig, error) {
+	sio := st.Stdio
+	if sio == nil {
+		return nil, nil
+	}
+	// Terminal output flows through the engine's pty bridge, which does not
+	// survive a daemon restart (the pty master is gone), so a fresh consumer
+	// would only block on an empty FIFO. Skip it.
+	if sio.Terminal {
+		return nil, nil
+	}
+	// A logger that survived the restart still owns the FIFO read side and
+	// holds the logger lock; spawning another consumer would duplicate it and
+	// block on that lock. Detect it by pid plus start time.
+	if st.LoggerPid > 0 {
+		if start, err := readStartTime(st.LoggerPid); err == nil && start == st.LoggerStart {
+			return nil, nil
+		}
+	}
+	stdoutURL, err := parseOutputURL(sio.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	stderrURL, err := parseOutputURL(sio.Stderr)
+	if err != nil {
+		return nil, err
+	}
+	bin := binarySchemeURL(stdoutURL, stderrURL)
+	if bin == nil {
+		return nil, nil
+	}
+	// A nerdctl logging URI can be served in-process. tryLock distinguishes a
+	// writer that survived the restart (external logger or a previous in-process
+	// holder) from a free lock, without disturbing it.
+	if dataStore, ok := nerdctlLogDataStore(bin); ok {
+		l, out, errF, lerr := startInProcessLog(dataStore, st.ID, st.Namespace, st.Bundle, true)
+		switch {
+		case lerr == nil:
+			cfg := &stdioConfig{
+				id:       st.ID,
+				ns:       st.Namespace,
+				bundle:   st.Bundle,
+				terminal: sio.Terminal,
+				log:      l,
+			}
+			if bin == stdoutURL {
+				cfg.stdout, cfg.stderr = out, errF
+			} else {
+				// Only stderr uses the logger; the stdout FIFO is unused.
+				_ = out.Close()
+				cfg.stderr = errF
+			}
+			return cfg, nil
+		case errors.Is(lerr, logdriver.ErrLocked):
+			// A live writer still holds the logger-lock; attaching here would
+			// duplicate it. Leave the task without a consumer.
+			return nil, nil
+		}
+		// Any other error falls through to the external logger path below.
+	}
+	b, err := startBinaryIO(bin, st.ID, st.Namespace, st.Bundle)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &stdioConfig{
+		id:       st.ID,
+		ns:       st.Namespace,
+		bundle:   st.Bundle,
+		terminal: sio.Terminal,
+		logger:   b.cmd,
+	}
+	if bin == stdoutURL {
+		cfg.stdout, cfg.stderr = b.outW, b.errW
+	} else {
+		// Only stderr uses the binary scheme; the logger's stdout end is unused.
+		_ = b.outW.Close()
+		cfg.stderr = b.errW
+	}
+	return cfg, nil
 }

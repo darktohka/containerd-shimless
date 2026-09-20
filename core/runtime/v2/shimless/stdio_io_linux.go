@@ -107,51 +107,74 @@ func openContainerInput(path string) (*os.File, error) {
 }
 
 // openContainerOutputs opens stdout and stderr for a non-terminal process. An
-// empty path yields /dev/null. A binary/binary-v2 URI starts one logging process
-// that owns both streams, mirroring the shim's NewBinaryIO.
-func (s *stdioConfig) openContainerOutputs(ctx context.Context, stdoutPath, stderrPath string) (stdout, stderr *os.File, logger *exec.Cmd, err error) {
+// empty path yields /dev/null. A binary/binary-v2 URI either starts one logging
+// process that owns both streams (mirroring the shim's NewBinaryIO) or, for a
+// nerdctl logging URI whose driver logdriver supports, serves both streams with
+// an in-process sink reading the same FIFOs.
+//
+// plog is non-nil only for the in-process path; logger is non-nil only for the
+// external path. Any in-process setup error falls back to the external logger,
+// preserving the previous behavior.
+func (s *stdioConfig) openContainerOutputs(ctx context.Context, stdoutPath, stderrPath string) (stdout, stderr *os.File, logger *exec.Cmd, plog *inProcessLog, err error) {
 	stdoutURL, err := parseOutputURL(stdoutPath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	stderrURL, err := parseOutputURL(stderrPath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	if bin := binarySchemeURL(stdoutURL, stderrURL); bin != nil {
-		b, err := startBinaryIO(bin, s.id, s.ns)
+		if dataStore, ok := nerdctlLogDataStore(bin); ok {
+			if l, out, errF, lerr := startInProcessLog(dataStore, s.id, s.ns, s.bundle, true); lerr == nil {
+				if bin == stdoutURL {
+					return out, errF, nil, l, nil
+				}
+				// Only stderr uses the logger: the stdout FIFO is unused.
+				_ = out.Close()
+				out2, oerr := openOutput(stdoutPath)
+				if oerr != nil {
+					_ = errF.Close()
+					_ = l.Close()
+					return nil, nil, nil, nil, oerr
+				}
+				return out2, errF, nil, l, nil
+			}
+		}
+
+		b, err := startBinaryIO(bin, s.id, s.ns, s.bundle)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if bin == stdoutURL {
-			return b.outW, b.errW, b.cmd, nil
+			return b.outW, b.errW, b.cmd, nil, nil
 		}
 		// Only stderr uses a binary logger: the logger's stdout pipe is unused.
 		if cerr := b.outW.Close(); cerr != nil {
 			_ = b.errW.Close()
 			_ = stopLogger(b.cmd)
-			return nil, nil, nil, fmt.Errorf("close unused logging stdout pipe: %w", cerr)
+			return nil, nil, nil, nil, fmt.Errorf("close unused logging stdout pipe: %w", cerr)
 		}
 		out, err := openOutput(stdoutPath)
 		if err != nil {
 			_ = b.errW.Close()
 			_ = stopLogger(b.cmd)
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return out, b.errW, b.cmd, nil
+		return out, b.errW, b.cmd, nil, nil
 	}
 
 	stdout, err = openOutput(stdoutPath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	stderr, err = openOutput(stderrPath)
 	if err != nil {
 		_ = stdout.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return stdout, stderr, nil, nil
+	return stdout, stderr, nil, nil, nil
 }
 
 // openOutput opens one container output path. An empty path yields /dev/null so
@@ -211,39 +234,50 @@ func openBridgeInput(ctx context.Context, path string) (io.ReadCloser, error) {
 }
 
 // openBridgeOutput opens the client stdout side of a terminal bridge. A binary
-// URI starts a logging process and its stdout pipe receives the pty output; the
-// logger's stderr pipe is unused because terminal stderr is part of the pty.
-func (s *stdioConfig) openBridgeOutput(ctx context.Context, path string) (io.WriteCloser, *exec.Cmd, error) {
+// URI either starts a logging process whose stdout pipe receives the pty output
+// or, for a nerdctl logging URI whose driver logdriver supports, bridges the pty
+// into the same stdout FIFO an in-process reader drains. The logger's stderr
+// pipe/FIFO is unused because terminal stderr is part of the pty.
+//
+// plog is non-nil only for the in-process path; logger is non-nil only for the
+// external path. Any in-process setup error falls back to the external logger.
+func (s *stdioConfig) openBridgeOutput(ctx context.Context, path string) (io.WriteCloser, *exec.Cmd, *inProcessLog, error) {
 	if path == "" {
 		f, err := openNull(os.O_WRONLY)
-		return f, nil, err
+		return f, nil, nil, err
 	}
 	u, err := parseStdioURL(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	switch u.Scheme {
 	case "binary", "binary-v2":
-		b, err := startBinaryIO(u, s.id, s.ns)
+		if dataStore, ok := nerdctlLogDataStore(u); ok {
+			if l, out, errF, lerr := startInProcessLog(dataStore, s.id, s.ns, s.bundle, true); lerr == nil {
+				_ = errF.Close()
+				return out, nil, l, nil
+			}
+		}
+		b, err := startBinaryIO(u, s.id, s.ns, s.bundle)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		_ = b.errW.Close()
-		return b.outW, b.cmd, nil
+		return b.outW, b.cmd, nil, nil
 	case "fifo":
 		f, err := openBridgeFifoOutput(u.Path)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return f, nil, nil
+		return f, nil, nil, nil
 	case "file":
 		f, err := openOutput(path)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return f, nil, nil
+		return f, nil, nil, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported terminal output scheme %q", u.Scheme)
+		return nil, nil, nil, fmt.Errorf("unsupported terminal output scheme %q", u.Scheme)
 	}
 }
 

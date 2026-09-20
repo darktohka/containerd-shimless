@@ -235,12 +235,22 @@ func (e *Engine) Create(ctx context.Context, taskID, bundlePath string, spec typ
 	if cg != nil {
 		st.Cgroup = cg.path
 	}
+	// Persist stdio before crun create so a crash mid-create is reconcilable:
+	// a later daemon can re-open the task's stdio FIFOs from the bundle.
+	if opts.IO.Terminal || opts.IO.Stdin != "" || opts.IO.Stdout != "" || opts.IO.Stderr != "" {
+		st.Stdio = &stdioState{
+			Terminal: opts.IO.Terminal,
+			Stdin:    opts.IO.Stdin,
+			Stdout:   opts.IO.Stdout,
+			Stderr:   opts.IO.Stderr,
+		}
+	}
 	if err := writeState(bundlePath, st); err != nil {
 		return nil, err
 	}
 
 	pidFile := pidFilePath(bundlePath)
-	stdio, err := newStdioConfig(ctx, taskID, ns, opts.IO)
+	stdio, err := newStdioConfig(ctx, taskID, ns, bundlePath, opts.IO)
 	if err != nil {
 		e.discardCreated(ctx, taskID, bundlePath, cg)
 		return nil, fmt.Errorf("prepare stdio for %s: %w", taskID, err)
@@ -290,7 +300,12 @@ func (e *Engine) Create(ctx context.Context, taskID, bundlePath string, spec typ
 	st.Pid = pid
 	st.StartTime = startTime
 	t := e.newTask(st, pidfd, cg)
+	t.io = opts.IO
 	t.stdio = stdio
+	if lpid, lstart := stdio.loggerPID(); lpid > 0 {
+		st.LoggerPid = lpid
+		st.LoggerStart = lstart
+	}
 	if err := writeState(bundlePath, st); err != nil {
 		if pidfd >= 0 {
 			unix.Close(pidfd)

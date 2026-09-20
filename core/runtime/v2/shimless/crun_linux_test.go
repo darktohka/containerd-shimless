@@ -73,7 +73,7 @@ func TestGetLastRuntimeError(t *testing.T) {
 }
 
 func TestNewStdioConfigEmptyIOOpensRealFiles(t *testing.T) {
-	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	s, err := newStdioConfig(context.Background(), "id", "ns", "", runtime.IO{})
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}

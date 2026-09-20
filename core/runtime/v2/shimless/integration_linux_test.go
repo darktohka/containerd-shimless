@@ -615,7 +615,7 @@ func TestIntegrationCrunPidfdAutokillPrimitive(t *testing.T) {
 	ctx := context.Background()
 	taskID := fmt.Sprintf("shimless-prim-%d", os.Getpid())
 	pidFile := pidFilePath(bundle)
-	stdio, err := newStdioConfig(ctx, taskID, integrationNamespace, integrationIO(t))
+	stdio, err := newStdioConfig(ctx, taskID, integrationNamespace, bundle, integrationIO(t))
 	if err != nil {
 		t.Fatalf("newStdioConfig: %v", err)
 	}

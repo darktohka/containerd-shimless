@@ -60,7 +60,7 @@ type task struct {
 	pidfd   int
 	cgroup  *cgroup
 	execs   map[string]*execProcess
-	exitCh  chan *runtime.Exit
+	exitCh  chan struct{}
 	deleted bool
 	// started and exitPublished gate TaskExit publishing behind TaskStart.
 	started       bool
@@ -148,7 +148,10 @@ func (t *task) Wait(ctx context.Context) (*runtime.Exit, error) {
 	t.mu.Unlock()
 
 	select {
-	case ex := <-ch:
+	case <-ch:
+		t.mu.Lock()
+		ex := t.exit
+		t.mu.Unlock()
 		return ex, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -319,8 +322,7 @@ func (t *task) finish(rec exitRecord) {
 		t.mu.Unlock()
 		return
 	}
-	ex := &runtime.Exit{Pid: uint32(t.pid), Status: rec.Status, Timestamp: rec.ExitedAt}
-	t.exit = ex
+	t.exit = &runtime.Exit{Pid: uint32(t.pid), Status: rec.Status, Timestamp: rec.ExitedAt}
 	t.exitRec = &exitState{
 		Pid:      uint32(t.pid),
 		Status:   rec.Status,
@@ -331,6 +333,7 @@ func (t *task) finish(rec exitRecord) {
 	t.status = runtime.StoppedStatus
 	t.pidfd = -1
 	ch := t.exitChLocked()
+	close(ch)
 	execs := make([]*execProcess, 0, len(t.execs))
 	for _, p := range t.execs {
 		execs = append(execs, p)
@@ -348,17 +351,15 @@ func (t *task) finish(rec exitRecord) {
 	for _, p := range execs {
 		p.markParentExited()
 	}
-
-	select {
-	case ch <- ex:
-	default:
-	}
 }
 
-// exitChLocked lazily creates the exit channel. The caller must hold t.mu.
-func (t *task) exitChLocked() chan *runtime.Exit {
+// exitChLocked lazily creates the channel that is closed when the task exits.
+// It broadcasts the exit to every waiter, so a task may be awaited by more than
+// one caller at once (for example a logging consumer and a client). The caller
+// must hold t.mu.
+func (t *task) exitChLocked() chan struct{} {
 	if t.exitCh == nil {
-		t.exitCh = make(chan *runtime.Exit, 1)
+		t.exitCh = make(chan struct{})
 	}
 	return t.exitCh
 }
@@ -492,6 +493,7 @@ func (t *task) ensureExit(ctx context.Context) *runtime.Exit {
 	}
 	t.status = runtime.StoppedStatus
 	ch := t.exitChLocked()
+	close(ch)
 	rec := *t.exitRec
 	id := t.id
 	t.mu.Unlock()
@@ -500,10 +502,6 @@ func (t *task) ensureExit(ctx context.Context) *runtime.Exit {
 		t.engine.logger.WithError(err).WithField("id", id).Warn("failed to persist synthesized exit")
 	}
 	t.publishExit()
-	select {
-	case ch <- ex:
-	default:
-	}
 	return ex
 }
 
@@ -520,7 +518,7 @@ type execProcess struct {
 	pidfd  int
 	status runtime.Status
 	exit   *runtime.Exit
-	exitCh chan *runtime.Exit
+	exitCh chan struct{}
 }
 
 var _ runtime.ExecProcess = (*execProcess)(nil)
@@ -554,7 +552,7 @@ func (p *execProcess) Start(ctx context.Context) error {
 	p.mu.Unlock()
 
 	pidFile := p.procFile + ".pid"
-	stdio, err := newStdioConfig(ctx, p.task.id, p.task.namespace, p.io)
+	stdio, err := newStdioConfig(ctx, p.id, p.task.namespace, p.task.bundle, p.io)
 	if err != nil {
 		return fmt.Errorf("prepare stdio for exec %s: %w", p.id, err)
 	}
@@ -607,13 +605,16 @@ func (p *execProcess) Wait(ctx context.Context) (*runtime.Exit, error) {
 		return ex, nil
 	}
 	if p.exitCh == nil {
-		p.exitCh = make(chan *runtime.Exit, 1)
+		p.exitCh = make(chan struct{})
 	}
 	ch := p.exitCh
 	p.mu.Unlock()
 
 	select {
-	case ex := <-ch:
+	case <-ch:
+		p.mu.Lock()
+		ex := p.exit
+		p.mu.Unlock()
 		return ex, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -660,6 +661,13 @@ func (p *execProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 		p.pidfd = -1
 	}
 	ex := p.exit
+	if ex == nil {
+		ex = &runtime.Exit{Pid: uint32(p.pid), Status: 255, Timestamp: time.Now().UTC()}
+		p.exit = ex
+		if p.exitCh != nil {
+			close(p.exitCh)
+		}
+	}
 	stdio := p.stdio
 	p.stdio = nil
 	p.status = runtime.DeletedStatus
@@ -675,9 +683,6 @@ func (p *execProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 	delete(p.task.execs, p.id)
 	p.task.mu.Unlock()
 
-	if ex == nil {
-		ex = &runtime.Exit{Pid: uint32(p.pid), Status: 255, Timestamp: time.Now().UTC()}
-	}
 	return ex, nil
 }
 
@@ -688,14 +693,14 @@ func (p *execProcess) finish(rec exitRecord) {
 		p.mu.Unlock()
 		return
 	}
-	ex := &runtime.Exit{Pid: uint32(p.pid), Status: rec.Status, Timestamp: rec.ExitedAt}
-	p.exit = ex
+	p.exit = &runtime.Exit{Pid: uint32(p.pid), Status: rec.Status, Timestamp: rec.ExitedAt}
 	p.status = runtime.StoppedStatus
 	p.pidfd = -1
 	if p.exitCh == nil {
-		p.exitCh = make(chan *runtime.Exit, 1)
+		p.exitCh = make(chan struct{})
 	}
 	ch := p.exitCh
+	close(ch)
 	taskID := p.task.id
 	ns := p.task.namespace
 	execID := p.id
@@ -710,11 +715,6 @@ func (p *execProcess) finish(rec exitRecord) {
 		ExitStatus:  rec.Status,
 		ExitedAt:    timestamppb.New(rec.ExitedAt),
 	})
-
-	select {
-	case ch <- ex:
-	default:
-	}
 }
 
 // markParentExited marks an exec as stopped when its task exits.
