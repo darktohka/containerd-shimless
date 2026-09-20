@@ -615,8 +615,16 @@ func TestIntegrationCrunPidfdAutokillPrimitive(t *testing.T) {
 	ctx := context.Background()
 	taskID := fmt.Sprintf("shimless-prim-%d", os.Getpid())
 	pidFile := pidFilePath(bundle)
-	if err := driver.create(ctx, taskID, bundle, pidFile, integrationIO(t)); err != nil {
+	stdio, err := newStdioConfig(ctx, taskID, integrationNamespace, integrationIO(t))
+	if err != nil {
+		t.Fatalf("newStdioConfig: %v", err)
+	}
+	defer stdio.Close()
+	if err := driver.create(ctx, taskID, bundle, pidFile, stdio); err != nil {
 		t.Fatalf("crun create: %v", err)
+	}
+	if err := stdio.finish(ctx); err != nil {
+		t.Fatalf("stdio finish: %v", err)
 	}
 	t.Cleanup(func() { _ = driver.delete(context.Background(), taskID, true) })
 

@@ -240,9 +240,20 @@ func (e *Engine) Create(ctx context.Context, taskID, bundlePath string, spec typ
 	}
 
 	pidFile := pidFilePath(bundlePath)
-	if err := e.crun.create(ctx, taskID, bundlePath, pidFile, opts.IO); err != nil {
+	stdio, err := newStdioConfig(ctx, taskID, ns, opts.IO)
+	if err != nil {
+		e.discardCreated(ctx, taskID, bundlePath, cg)
+		return nil, fmt.Errorf("prepare stdio for %s: %w", taskID, err)
+	}
+	if err := e.crun.create(ctx, taskID, bundlePath, pidFile, stdio); err != nil {
+		_ = stdio.Close()
 		e.discardCreated(ctx, taskID, bundlePath, cg)
 		return nil, err
+	}
+	if err := stdio.finish(ctx); err != nil {
+		_ = stdio.Close()
+		e.discardCreated(ctx, taskID, bundlePath, cg)
+		return nil, fmt.Errorf("finish stdio for %s: %w", taskID, err)
 	}
 
 	pid, err := readPidFile(pidFile)
@@ -279,6 +290,7 @@ func (e *Engine) Create(ctx context.Context, taskID, bundlePath string, spec typ
 	st.Pid = pid
 	st.StartTime = startTime
 	t := e.newTask(st, pidfd, cg)
+	t.stdio = stdio
 	if err := writeState(bundlePath, st); err != nil {
 		if pidfd >= 0 {
 			unix.Close(pidfd)

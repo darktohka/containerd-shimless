@@ -30,9 +30,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/log"
-	"golang.org/x/sys/unix"
 )
 
 // crunDriver runs the crun CLI. crun owns the container stdio and the init
@@ -91,19 +89,24 @@ func (d *crunDriver) run(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 // create creates the container without starting its user process. crun writes
-// the init pid to pidFile. The container's stdio files are opened and handed to
-// crun, which passes them to the init before exiting.
-func (d *crunDriver) create(ctx context.Context, id, bundle, pidFile string, io runtime.IO) error {
+// the init pid to pidFile. The container's stdio is supplied by the caller's
+// stdioConfig: terminal processes get a --console-socket so crun hands the pty
+// master back to the engine, non-terminal processes get real fds (never a
+// typed-nil) so the container always has open fd 0/1/2.
+func (d *crunDriver) create(ctx context.Context, id, bundle, pidFile string, stdio *stdioConfig) error {
 	args := []string{"create", "--bundle", bundle, "--pid-file", pidFile}
+	if stdio != nil && stdio.terminal && stdio.consoleSocket != nil {
+		args = append(args, "--console-socket", stdio.consoleSocket.Path())
+	}
 	args = append(args, id)
 	cmd := d.command(ctx, args...)
-	stdin, stdout, stderr, cleanup := openContainerIO(io)
-	defer cleanup()
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	stdio.apply(cmd)
 	// Use a file, not a pipe: the unstarted init inherits crun's stderr write
-	// end, so a bytes.Buffer would block Run until the container exits.
+	// end, so a bytes.Buffer would block Run until the container exits. A
+	// terminal process has no cmd.Stderr yet, so this also captures crun's own
+	// diagnostics.
 	var diag *os.File
-	if stderr == nil {
+	if cmd.Stderr == nil {
 		f, ferr := os.CreateTemp("", "shimless-crun-stderr-")
 		if ferr == nil {
 			diag = f
@@ -196,17 +199,19 @@ func (d *crunDriver) resume(ctx context.Context, id string) error {
 }
 
 // execProcess runs a detached exec process and writes its pid to pidFile. The
-// process spec must already be written to a file on disk.
-func (d *crunDriver) execProcess(ctx context.Context, id, processFile, pidFile string, io runtime.IO) error {
+// process spec must already be written to a file on disk. A terminal exec gets
+// a --console-socket so crun hands the pty master back to the engine.
+func (d *crunDriver) execProcess(ctx context.Context, id, processFile, pidFile string, stdio *stdioConfig) error {
 	args := []string{"exec", "--process", processFile, "--detach", "--pid-file", pidFile}
-	if io.Terminal {
+	if stdio != nil && stdio.terminal {
 		args = append(args, "--tty")
+		if stdio.consoleSocket != nil {
+			args = append(args, "--console-socket", stdio.consoleSocket.Path())
+		}
 	}
 	args = append(args, id)
 	cmd := d.command(ctx, args...)
-	stdin, stdout, stderr, cleanup := openContainerIO(io)
-	defer cleanup()
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	stdio.apply(cmd)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("crun exec %s: %w", id, err)
 	}
@@ -248,32 +253,5 @@ func (d *crunDriver) getLastRuntimeError(bundle string) error {
 		return errors.New(rec.Msg)
 	default:
 		return nil
-	}
-}
-
-// openContainerIO opens the container's stdio files. O_RDWR opens a FIFO that
-// has no peer yet without blocking or failing; the caller closes its copies
-// after crun exits so the consumer still observes EOF once the container is
-// gone. Missing paths are left nil so crun inherits the daemon's own stdio.
-func openContainerIO(io runtime.IO) (stdin, stdout, stderr *os.File, cleanup func()) {
-	var opened []*os.File
-	open := func(path string) *os.File {
-		if path == "" {
-			return nil
-		}
-		f, err := os.OpenFile(path, os.O_RDWR|unix.O_NONBLOCK, 0)
-		if err != nil {
-			return nil
-		}
-		opened = append(opened, f)
-		return f
-	}
-	stdin = open(io.Stdin)
-	stdout = open(io.Stdout)
-	stderr = open(io.Stderr)
-	return stdin, stdout, stderr, func() {
-		for _, f := range opened {
-			f.Close()
-		}
 	}
 }

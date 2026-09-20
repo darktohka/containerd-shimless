@@ -72,10 +72,17 @@ func TestGetLastRuntimeError(t *testing.T) {
 	}
 }
 
-func TestOpenContainerIOMissingPaths(t *testing.T) {
-	stdin, stdout, stderr, cleanup := openContainerIO(runtime.IO{})
-	defer cleanup()
-	if stdin != nil || stdout != nil || stderr != nil {
-		t.Fatalf("empty IO should leave all files nil, got %v %v %v", stdin, stdout, stderr)
+func TestNewStdioConfigEmptyIOOpensRealFiles(t *testing.T) {
+	s, err := newStdioConfig(context.Background(), "id", "ns", runtime.IO{})
+	if err != nil {
+		t.Fatalf("newStdioConfig: %v", err)
+	}
+	defer s.Close()
+	stdin, stdout, stderr := s.containerFiles()
+	if stdin == nil || stdout == nil || stderr == nil {
+		t.Fatalf("empty IO must open real fds, got %v %v %v", stdin, stdout, stderr)
+	}
+	if stdin.Name() != os.DevNull {
+		t.Fatalf("empty stdin opened %q, want %q", stdin.Name(), os.DevNull)
 	}
 }

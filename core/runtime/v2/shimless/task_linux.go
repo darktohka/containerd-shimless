@@ -49,6 +49,7 @@ type task struct {
 	bundle    string
 	pid       int
 	io        runtime.IO
+	stdio     *stdioConfig
 
 	mu      sync.Mutex
 	status  runtime.Status
@@ -181,8 +182,14 @@ func (t *task) Kill(ctx context.Context, signal uint32, all bool) error {
 	return nil
 }
 
-func (t *task) ResizePty(context.Context, runtime.ConsoleSize) error {
-	return fmt.Errorf("resize pty for task %s: %w", t.id, errdefs.ErrNotImplemented)
+func (t *task) ResizePty(_ context.Context, size runtime.ConsoleSize) error {
+	t.mu.Lock()
+	s := t.stdio
+	t.mu.Unlock()
+	if s == nil {
+		return nil
+	}
+	return s.Resize(size)
 }
 
 func (t *task) CloseIO(context.Context) error {
@@ -410,6 +417,8 @@ func (t *task) remove(ctx context.Context) (*runtime.Exit, error) {
 	status := t.status
 	pidfd := t.pidfd
 	cg := t.cgroup
+	stdio := t.stdio
+	t.stdio = nil
 	t.mu.Unlock()
 
 	if status != runtime.StoppedStatus {
@@ -436,6 +445,11 @@ func (t *task) remove(ctx context.Context) (*runtime.Exit, error) {
 	// prevent the engine from forgetting the task.
 	if err := t.engine.crun.delete(context.WithoutCancel(ctx), t.id, true); err != nil {
 		t.engine.logger.WithError(err).WithField("id", t.id).Debug("crun delete failed")
+	}
+	if stdio != nil {
+		if err := stdio.Close(); err != nil {
+			t.engine.logger.WithError(err).WithField("id", t.id).Debug("failed to close stdio")
+		}
 	}
 	if cg != nil {
 		if err := cg.Delete(); err != nil {
@@ -498,6 +512,7 @@ type execProcess struct {
 	id       string
 	task     *task
 	io       runtime.IO
+	stdio    *stdioConfig
 	procFile string
 
 	mu     sync.Mutex
@@ -539,11 +554,21 @@ func (p *execProcess) Start(ctx context.Context) error {
 	p.mu.Unlock()
 
 	pidFile := p.procFile + ".pid"
-	if err := p.task.engine.crun.execProcess(ctx, p.task.id, p.procFile, pidFile, p.io); err != nil {
+	stdio, err := newStdioConfig(ctx, p.task.id, p.task.namespace, p.io)
+	if err != nil {
+		return fmt.Errorf("prepare stdio for exec %s: %w", p.id, err)
+	}
+	if err := p.task.engine.crun.execProcess(ctx, p.task.id, p.procFile, pidFile, stdio); err != nil {
+		_ = stdio.Close()
 		return err
+	}
+	if err := stdio.finish(ctx); err != nil {
+		_ = stdio.Close()
+		return fmt.Errorf("finish stdio for exec %s: %w", p.id, err)
 	}
 	pid, err := readPidFile(pidFile)
 	if err != nil {
+		_ = stdio.Close()
 		return err
 	}
 	pidfd := -1
@@ -557,6 +582,7 @@ func (p *execProcess) Start(ctx context.Context) error {
 	p.pid = pid
 	p.pidfd = pidfd
 	p.status = runtime.RunningStatus
+	p.stdio = stdio
 	p.mu.Unlock()
 
 	if pidfd >= 0 {
@@ -615,8 +641,14 @@ func (p *execProcess) Kill(ctx context.Context, signal uint32, all bool) error {
 	return nil
 }
 
-func (p *execProcess) ResizePty(context.Context, runtime.ConsoleSize) error {
-	return fmt.Errorf("resize pty for exec %s: %w", p.id, errdefs.ErrNotImplemented)
+func (p *execProcess) ResizePty(_ context.Context, size runtime.ConsoleSize) error {
+	p.mu.Lock()
+	s := p.stdio
+	p.mu.Unlock()
+	if s == nil {
+		return nil
+	}
+	return s.Resize(size)
 }
 
 func (p *execProcess) CloseIO(context.Context) error { return nil }
@@ -628,8 +660,16 @@ func (p *execProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 		p.pidfd = -1
 	}
 	ex := p.exit
+	stdio := p.stdio
+	p.stdio = nil
 	p.status = runtime.DeletedStatus
 	p.mu.Unlock()
+
+	if stdio != nil {
+		if err := stdio.Close(); err != nil {
+			p.task.engine.logger.WithError(err).WithField("exec", p.id).Debug("failed to close exec stdio")
+		}
+	}
 
 	p.task.mu.Lock()
 	delete(p.task.execs, p.id)
